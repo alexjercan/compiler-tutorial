@@ -439,6 +439,19 @@ void parse_instr(struct parser *p, struct instr_node *instr) {
     }
 }
 
+int find_variable(ds_dynamic_array *variables, char *ident) {
+    for (unsigned int i = 0; i < variables->count; i++) {
+        char *variable = NULL;
+        ds_dynamic_array_get(variables, i, &variable);
+
+        if (strcmp(ident, variable) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 void parse_program(struct parser *p, struct program_node *program) {
     ds_dynamic_array_init(&program->instrs, sizeof(struct instr_node));
 
@@ -454,71 +467,207 @@ void parse_program(struct parser *p, struct program_node *program) {
     } while (token.kind != END);
 }
 
-void print_term(struct term_node *term) {
+void term_asm(struct term_node *term, ds_dynamic_array *variables) {
     switch (term->kind) {
-    case TERM_INPUT:
-        printf("input\n");
+    case TERM_INPUT: {
+        printf("    read 0, line, LINE_MAX\n");
+        printf("    mov rdi, line\n");
+        printf("    call strlen\n");
+        printf("    mov rdi, line\n");
+        printf("    mov rsi, rax\n");
+        printf("    call parse_uint\n");
         break;
+    }
     case TERM_INT:
-        printf("%s\n", term->value);
+        printf("    mov rax, %s\n", term->value);
         break;
-    case TERM_IDENT:
-        printf("%s\n", term->value);
+    case TERM_IDENT: {
+        int index = find_variable(variables, term->value);
+        printf("    mov rax, qword [rbp - %d]\n", index * 8 + 8);
+        break;
+    }
+    }
+}
+
+void expr_asm(struct expr_node *expr, ds_dynamic_array *variables) {
+    switch (expr->kind) {
+    case EXPR_TERM: {
+        term_asm(&expr->term, variables);
+        break;
+    }
+    case EXPR_PLUS:
+        term_asm(&expr->add.lhs, variables);
+        printf("    mov rdx, rax\n");
+        term_asm(&expr->add.rhs, variables);
+        printf("    add rax, rdx\n");
         break;
     }
 }
 
-void print_instr(struct instr_node instr) {
-    switch (instr.kind) {
+void rel_asm(struct rel_node *rel, ds_dynamic_array *variables) {
+    switch (rel->kind) {
+    case REL_LESS_THAN:
+        term_asm(&rel->less_than.lhs, variables);
+        printf("    mov rdx, rax\n");
+        term_asm(&rel->less_than.rhs, variables);
+        printf("    cmp rdx, rax\n");
+        printf("    setl al\n");
+        printf("    and al, 1\n");
+        printf("    movzx rax, al\n");
+        break;
+    }
+}
+
+void instr_asm(struct instr_node *instr, ds_dynamic_array *variables,
+               int *if_count) {
+    switch (instr->kind) {
     case INSTR_ASSIGN: {
-        printf("assign %s\n", instr.assign.ident);
-        switch (instr.assign.expr.kind) {
-        case EXPR_TERM: {
-            print_term(&instr.assign.expr.term);
-            break;
-        }
-        case EXPR_PLUS:
-            print_term(&instr.assign.expr.add.lhs);
-            printf("+\n");
-            print_term(&instr.assign.expr.add.rhs);
-            break;
-        }
+        expr_asm(&instr->assign.expr, variables); // the result is in rax
+        int index = find_variable(variables, instr->assign.ident);
+        printf("    mov qword [rbp - %d], rax\n", index * 8 + 8);
         break;
     }
     case INSTR_IF: {
-        printf("if\n");
-        switch (instr.if_.rel.kind) {
-        case REL_LESS_THAN:
-            print_term(&instr.if_.rel.less_than.lhs);
-            printf("<\n");
-            print_term(&instr.if_.rel.less_than.rhs);
-            break;
-        }
-        print_instr(*instr.if_.instr);
+        rel_asm(&instr->if_.rel, variables); // the result is in rax
+        int label = (*if_count)++;
+        printf("    test rax, rax\n");
+        printf("    jz .endif%d\n", label);
+        instr_asm(instr->if_.instr, variables, if_count);
+        printf(".endif%d:\n", label);
         break;
     }
     case INSTR_GOTO: {
-        printf("goto %s\n", instr.goto_.label);
+        printf("    jmp .%s\n", instr->goto_.label);
         break;
     }
     case INSTR_OUTPUT: {
-        printf("output ");
-        print_term(&instr.output.term);
+        term_asm(&instr->output.term, variables);
+        printf("    mov rdi, 1\n");
+        printf("    mov rsi, rax\n");
+        printf("    call write_uint\n");
         break;
     }
     case INSTR_LABEL:
-        printf("label %s\n", instr.label.label);
+        printf(".%s:\n", instr->label.label);
         break;
     }
 }
 
-void print_program(struct program_node *program) {
+void term_declare_variables(struct term_node *term,
+                            ds_dynamic_array *variables) {
+    switch (term->kind) {
+    case TERM_INPUT:
+        break;
+    case TERM_INT:
+        break;
+    case TERM_IDENT:
+        for (unsigned int i = 0; i < variables->count; i++) {
+            char *variable = NULL;
+            ds_dynamic_array_get(variables, i, &variable);
+
+            if (strcmp(term->value, variable) == 0) {
+                return;
+            }
+        }
+        DS_PANIC("Identifier is not defined %s", term->value);
+        break;
+    }
+}
+
+void expr_declare_variables(struct expr_node *expr,
+                            ds_dynamic_array *variables) {
+    switch (expr->kind) {
+    case EXPR_TERM: {
+        term_declare_variables(&expr->term, variables);
+        break;
+    }
+    case EXPR_PLUS:
+        term_declare_variables(&expr->add.lhs, variables);
+        term_declare_variables(&expr->add.rhs, variables);
+        break;
+    }
+}
+
+void rel_declare_variables(struct rel_node *rel, ds_dynamic_array *variables) {
+    switch (rel->kind) {
+    case REL_LESS_THAN:
+        term_declare_variables(&rel->less_than.lhs, variables);
+        term_declare_variables(&rel->less_than.rhs, variables);
+        break;
+    }
+}
+
+void instr_declare_variables(struct instr_node *instr,
+                             ds_dynamic_array *variables) {
+    switch (instr->kind) {
+    case INSTR_ASSIGN: {
+        expr_declare_variables(&instr->assign.expr, variables);
+        for (unsigned int i = 0; i < variables->count; i++) {
+            char *variable = NULL;
+            ds_dynamic_array_get(variables, i, &variable);
+
+            if (strcmp(instr->assign.ident, variable) == 0) {
+                return;
+            }
+        }
+        ds_dynamic_array_append(variables, &instr->assign.ident);
+        break;
+    }
+    case INSTR_IF: {
+        rel_declare_variables(&instr->if_.rel, variables);
+        instr_declare_variables(instr->if_.instr, variables);
+        break;
+    }
+    case INSTR_GOTO: {
+        break;
+    }
+    case INSTR_OUTPUT: {
+        term_declare_variables(&instr->output.term, variables);
+        break;
+    }
+    case INSTR_LABEL:
+        break;
+    }
+}
+
+void program_asm(struct program_node *program) {
+    int if_count = 0;
+    ds_dynamic_array variables;
+    ds_dynamic_array_init(&variables, sizeof(char *));
+
     for (unsigned int i = 0; i < program->instrs.count; i++) {
         struct instr_node instr;
         ds_dynamic_array_get(&program->instrs, i, &instr);
 
-        print_instr(instr);
+        instr_declare_variables(&instr, &variables);
     }
+
+    printf("format ELF64 executable\n");
+    printf("LINE_MAX equ 1024\n");
+    printf("segment readable executable\n");
+    printf("include \"linux.inc\"\n");
+    printf("include \"utils.inc\"\n");
+    printf("entry _start\n");
+    printf("_start:\n");
+
+    printf("    mov rbp, rsp\n");
+    printf("    sub rsp, %d\n", variables.count * 8);
+
+    for (unsigned int i = 0; i < program->instrs.count; i++) {
+        struct instr_node instr;
+        ds_dynamic_array_get(&program->instrs, i, &instr);
+
+        instr_asm(&instr, &variables, &if_count);
+    }
+
+    printf("    add rsp, %d\n", variables.count * 8);
+
+    printf("    mov rax, 60\n");
+    printf("    xor rdi, rdi\n");
+    printf("    syscall\n");
+
+    printf("segment readable writeable\n");
+    printf("line rb LINE_MAX\n");
 }
 
 int main() {
@@ -529,11 +678,6 @@ int main() {
     ds_dynamic_array_init(&tokens, sizeof(struct token));
 
     lexer_tokenize(buffer, length, &tokens);
-    for (unsigned int i = 0; i < tokens.count; i++) {
-        struct token tok;
-        ds_dynamic_array_get(&tokens, i, &tok);
-        print_token(tok);
-    }
 
     struct parser p;
     struct program_node program;
@@ -541,5 +685,5 @@ int main() {
     parser_init(tokens, &p);
     parse_program(&p, &program);
 
-    print_program(&program);
+    program_asm(&program);
 }
